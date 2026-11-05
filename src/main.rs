@@ -115,7 +115,10 @@ impl Notice {
 fn discard_input(decoder: &mut Decoder, bytes: &[u8]) -> bool {
     let mut cancel = false;
     for byte in bytes {
-        for key in decoder.feed(*byte).into_iter().flatten() {
+        let was_paste = decoder.pasting();
+        let events = decoder.feed(*byte);
+        cancel |= was_paste || decoder.pasting();
+        for key in events.into_iter().flatten() {
             match key {
                 Key::Quit | Key::Char(b'q') => STOP.store(true, Ordering::Relaxed),
                 Key::Suspend => SUSPEND.store(true, Ordering::Relaxed),
@@ -317,18 +320,30 @@ fn run() -> Result<(), String> {
         } else {
             None
         };
-        let discard = arming && ready > 0;
+        let mut discard = arming && ready > 0;
         if ready == 0 {
             arming = false;
         }
         // The extra iteration delivers a timed standalone Escape without inventing
         // a byte that could enter a filter or dispatch a destructive shortcut.
         'batch: for i in 0..(count as usize + usize::from(escaped.is_some())) {
+            let was_paste = decoder.pasting();
             let events = if i < count as usize {
                 decoder.feed(input[i])
             } else {
                 [escaped, None]
             };
+            if was_paste || decoder.pasting() {
+                if pending.take().is_some() {
+                    notice = Some(Notice::new(
+                        "Paste ignored; pending action cancelled".into(),
+                        true,
+                    ));
+                    dirty = true;
+                }
+                arming = true;
+                discard = true;
+            }
             for key in events.into_iter().flatten() {
                 if matches!(key, Key::Quit) || (editor.is_none() && key == Key::Char(b'q')) {
                     STOP.store(true, Ordering::Relaxed);
@@ -358,7 +373,7 @@ fn run() -> Result<(), String> {
                                 "Resize to at least 42x12; action cancelled".into(),
                                 true,
                             ));
-                            discard_input(
+                            arming = discard_input(
                                 &mut decoder,
                                 &input[(i + 1).min(count as usize)..count as usize],
                             );
@@ -376,7 +391,7 @@ fn run() -> Result<(), String> {
                         system.sample();
                         tasks.refresh(&system, sort);
                         next = Instant::now() + interval;
-                        discard_input(
+                        arming = discard_input(
                             &mut decoder,
                             &input[(i + 1).min(count as usize)..count as usize],
                         );
@@ -490,13 +505,14 @@ fn run() -> Result<(), String> {
                         }
                         // Preserve framing while discarding queued activation input.
                         // Arm only after the prompt is drawn and input has gone quiet.
-                        if discard_input(
+                        let cancelled = discard_input(
                             &mut decoder,
                             &input[(i + 1).min(count as usize)..count as usize],
-                        ) {
+                        );
+                        if cancelled {
                             pending = None;
                         }
-                        arming = pending.is_some();
+                        arming = cancelled || pending.is_some();
                         break 'batch;
                     }
                     Key::Char(b' ') => {

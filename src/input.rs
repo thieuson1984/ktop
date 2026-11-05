@@ -33,6 +33,9 @@ enum State {
     Paste(usize),
 }
 impl Decoder {
+    pub fn pasting(&self) -> bool {
+        matches!(self.state, State::Paste(_))
+    }
     pub fn waiting_escape(&self) -> bool {
         matches!(self.state, State::Escape)
     }

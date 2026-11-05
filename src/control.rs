@@ -170,14 +170,24 @@ mod tests {
     #[test]
     fn protected_and_stale_identities_are_never_signalled() {
         for pid in [0, 1, std::process::id(), u32::MAX] {
-            assert!(
-                Pending::open(Identity { pid, start: 0 }, String::new(), Action::Kill).is_err()
+            assert_eq!(
+                Pending::open(Identity { pid, start: 0 }, String::new(), Action::Kill)
+                    .err()
+                    .expect("protected process was accepted")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
             );
         }
         let child = Guard::spawn();
         let mut wrong = child.identity();
         wrong.start = wrong.start.wrapping_add(1);
-        assert!(Pending::open(wrong, String::new(), Action::Kill).is_err());
+        assert_eq!(
+            Pending::open(wrong, String::new(), Action::Kill)
+                .err()
+                .expect("stale identity was accepted")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         assert!(!stopped(child.0.id()));
     }
     #[test]
