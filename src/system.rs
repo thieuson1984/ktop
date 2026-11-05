@@ -684,6 +684,9 @@ fn root_space() -> Option<(u64, u64)> {
     }
     let stat = unsafe { stat.assume_init() };
     let size = stat.f_frsize;
+    // musl uses a 32-bit block-size field on ARMv7, but 64-bit block counts.
+    #[cfg(target_pointer_width = "32")]
+    let size = u64::from(size);
     if size == 0 {
         return None;
     }
