@@ -1,14 +1,15 @@
 mod hardware;
 mod system;
+mod ui;
 
 use hardware::Hardware;
 use std::{
-    fmt::Write as _,
     io::{self, IsTerminal, Write},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use system::{Process, System};
+use system::System;
+use ui::{Frame, View};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: libc::c_int) {
@@ -93,19 +94,21 @@ fn run() -> Result<(), String> {
         std::thread::sleep(opts.interval);
         system.sample();
         let hardware = Hardware::collect();
-        for line in render(
+        let mut frame = Frame::new(100, 40);
+        frame.render(
             &system,
             &hardware,
-            100,
-            60,
-            Sort::Cpu,
-            0,
-            1,
-            false,
-            opts.interval,
-        ) {
-            println!("{}", clean(&line, 100));
-        }
+            View {
+                sort: Sort::Cpu,
+                offset: 0,
+                page: 1,
+                paused: false,
+                interval: opts.interval,
+            },
+        );
+        let mut output = String::new();
+        frame.write_plain(&mut output);
+        print!("{output}");
         return Ok(());
     }
     let mut terminal = Terminal::enter().map_err(|e| e.to_string())?;
@@ -119,6 +122,7 @@ fn run() -> Result<(), String> {
     let mut paused = false;
     let mut dirty = true;
     let mut size = dimensions();
+    let mut frame = Frame::new(size.0.saturating_sub(1), size.1);
     let mut escape = 0;
     while !STOP.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -138,16 +142,23 @@ fn run() -> Result<(), String> {
         }
         if dirty {
             offset = offset.min(if page == 2 {
-                hardware.gpus.len() + hardware.sensors.len()
+                ui::hardware_row_count(&system, &hardware).saturating_sub(1)
             } else {
                 system.processes.len().saturating_sub(1)
             });
-            let rows = render(
-                &system, &hardware, size.0, size.1, sort, offset, page, paused, interval,
+            frame.resize(size.0.saturating_sub(1), size.1);
+            frame.render(
+                &system,
+                &hardware,
+                View {
+                    sort,
+                    offset,
+                    page,
+                    paused,
+                    interval,
+                },
             );
-            terminal
-                .draw(&rows, size.0, size.1)
-                .map_err(|e| e.to_string())?;
+            terminal.draw(&frame).map_err(|e| e.to_string())?;
             dirty = false;
         }
         let mut poll = libc::pollfd {
@@ -237,216 +248,6 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn bytes(value: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut n = value as f64;
-    let mut unit = 0;
-    while n >= 1024.0 && unit < UNITS.len() - 1 {
-        n /= 1024.0;
-        unit += 1;
-    }
-    format!("{n:.1} {}", UNITS[unit])
-}
-fn bar(percent: f64, width: usize) -> String {
-    let used = ((percent.clamp(0.0, 100.0) / 100.0 * width as f64).round() as usize).min(width);
-    format!("[{}{}]", "|".repeat(used), " ".repeat(width - used))
-}
-fn percent(used: u64, total: u64) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        used as f64 * 100.0 / total as f64
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render(
-    s: &System,
-    h: &Hardware,
-    width: usize,
-    height: usize,
-    sort: Sort,
-    offset: usize,
-    page: u8,
-    paused: bool,
-    interval: Duration,
-) -> Vec<String> {
-    let mut rows = Vec::with_capacity(height);
-    if width < 42 || height < 12 {
-        rows.push("ktop - terminal too small".into());
-        rows.push("Resize to at least 42 columns x 12 rows.".into());
-        rows.push("q: quit".into());
-        return rows;
-    }
-    rows.push(format!(
-        "KTOP {} | {} | {:.1}s | {}",
-        env!("CARGO_PKG_VERSION"),
-        match page {
-            2 => "HARDWARE",
-            3 => "PROCESSES",
-            _ => "OVERVIEW",
-        },
-        interval.as_secs_f64(),
-        if paused { "PAUSED" } else { "LIVE" }
-    ));
-    rows.push(format!(
-        "Up {}d {:02}:{:02}:{:02} | Load {} | {} processes",
-        s.uptime / 86400,
-        s.uptime / 3600 % 24,
-        s.uptime / 60 % 60,
-        s.uptime % 60,
-        s.load,
-        s.processes.len()
-    ));
-    if let Some(error) = &s.error {
-        rows.push(format!("WARNING: {error}"));
-    }
-    if page == 2 {
-        rows.push("GPU / HWMON SENSORS (j/k scroll)".into());
-        let items: Vec<&str> = h
-            .gpus
-            .iter()
-            .chain(h.sensors.iter())
-            .map(String::as_str)
-            .collect();
-        if items.is_empty() {
-            rows.push("No readable hardware counters; kernel/driver support required.".into());
-        }
-        for line in items
-            .into_iter()
-            .skip(offset)
-            .take(height.saturating_sub(rows.len() + 1))
-        {
-            rows.push(line.into());
-        }
-    } else {
-        if page == 1 {
-            let cpu = s.cpu.first().copied().unwrap_or(0.0);
-            rows.push(format!(
-                "CPU {} {:5.1}% | {} cores{}",
-                bar(cpu, width.saturating_sub(42).clamp(8, 32)),
-                cpu,
-                s.cpu.len().saturating_sub(1),
-                s.mhz
-                    .map(|v| format!(" | CPU0 {v} MHz"))
-                    .unwrap_or_default()
-            ));
-            if height >= 24 {
-                let per_row = (width / 14).max(1);
-                for (chunk, cores) in s
-                    .cpu
-                    .get(1..)
-                    .unwrap_or(&[])
-                    .chunks(per_row)
-                    .take(2)
-                    .enumerate()
-                {
-                    let mut row = String::new();
-                    for (i, usage) in cores.iter().enumerate() {
-                        let _ = write!(row, " c{:<3} {:5.1}% ", chunk * per_row + i, usage);
-                    }
-                    rows.push(row);
-                }
-            }
-            rows.push(format!(
-                "RAM {} / {} ({:.1}%) | Swap {} / {}",
-                bytes(s.memory_used),
-                bytes(s.memory_total),
-                percent(s.memory_used, s.memory_total),
-                bytes(s.swap_used),
-                bytes(s.swap_total)
-            ));
-            if let Some((used, total)) = s.disk_space {
-                rows.push(format!(
-                    "Root {} / {} ({:.1}%)",
-                    bytes(used),
-                    bytes(total),
-                    percent(used, total)
-                ));
-            }
-            if height >= 20 {
-                for n in s.network.iter().take(2) {
-                    rows.push(format!(
-                        "NET {:12} RX {}/s  TX {}/s",
-                        n.name,
-                        bytes(n.read as u64),
-                        bytes(n.write as u64)
-                    ));
-                }
-                for d in s.disks.iter().take(2) {
-                    rows.push(format!(
-                        "I/O {:12} R  {}/s  W  {}/s",
-                        d.name,
-                        bytes(d.read as u64),
-                        bytes(d.write as u64)
-                    ));
-                }
-                if let Some(gpu) = h.gpus.first() {
-                    rows.push(format!("GPU {gpu}"));
-                }
-                if h.gpus.is_empty() {
-                    rows.push("GPU counters unavailable (no readable DRM device)".into());
-                }
-                for sensor in h.sensors.iter().take(if height >= 32 { 4 } else { 1 }) {
-                    rows.push(sensor.clone());
-                }
-            }
-            rows.push(String::new());
-        }
-        rows.push(format!(
-            "PROCESSES | sort {} | rows {}+ | CPU: 100% = one core",
-            sort.label(),
-            offset + 1
-        ));
-        rows.push(format!(
-            "{:>7} S {:>7} {:>10} {:>5}  NAME",
-            "PID", "CPU%", "RSS", "THR"
-        ));
-        let mut processes: Vec<&Process> = s.processes.values().collect();
-        processes.sort_unstable_by(|a, b| match sort {
-            Sort::Cpu => b
-                .cpu
-                .total_cmp(&a.cpu)
-                .then_with(|| b.rss.cmp(&a.rss))
-                .then_with(|| a.pid.cmp(&b.pid)),
-            Sort::Memory => b.rss.cmp(&a.rss).then_with(|| a.pid.cmp(&b.pid)),
-            Sort::Pid => a.pid.cmp(&b.pid),
-        });
-        let capacity = height.saturating_sub(rows.len() + 1);
-        for p in processes.into_iter().skip(offset).take(capacity) {
-            rows.push(format!(
-                "{:>7} {} {:>7.1} {:>10} {:>5}  {}",
-                p.pid,
-                p.state,
-                p.cpu,
-                bytes(p.rss),
-                p.threads,
-                p.name
-            ));
-        }
-    }
-    rows.truncate(height.saturating_sub(1));
-    while rows.len() < height - 1 {
-        rows.push(String::new());
-    }
-    rows.push("q quit | 1/2/3 pages | c/m/p sort | j/k scroll | Space pause | +/- rate".into());
-    rows
-}
-
-// Names from proc/sysfs are untrusted terminal content. Printable ASCII only:
-// strips escape/control sequences and gives deterministic column clipping.
-fn clean(line: &str, width: usize) -> String {
-    line.chars()
-        .take(width)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
 fn dimensions() -> (usize, usize) {
     let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) } == 0 {
@@ -495,18 +296,9 @@ impl Terminal {
         io::stdout().flush()?;
         Ok(terminal)
     }
-    fn draw(&mut self, rows: &[String], width: usize, height: usize) -> io::Result<()> {
+    fn draw(&mut self, frame: &Frame) -> io::Result<()> {
         self.output.clear();
-        for (i, row) in rows.iter().take(height).enumerate() {
-            let _ = write!(self.output, "\x1b[{};1H\x1b[2K", i + 1);
-            if i == 0 || i == height - 1 {
-                self.output.push_str("\x1b[1;36m");
-            }
-            // Reserve the final column to avoid automatic terminal wrapping.
-            self.output.push_str(&clean(row, width.saturating_sub(1)));
-            self.output.push_str("\x1b[0m");
-        }
-        self.output.push_str("\x1b[J");
+        frame.write_ansi(&mut self.output);
         let mut stdout = io::stdout().lock();
         stdout.write_all(self.output.as_bytes())?;
         stdout.flush()
@@ -522,15 +314,5 @@ fn restore(original: &libc::termios) {
 impl Drop for Terminal {
     fn drop(&mut self) {
         restore(&self.original);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn terminal_names_cannot_inject_escape_sequences() {
-        assert_eq!(clean("bad\x1b[2J\n\t\u{202e}name", 80), "bad?[2J???name");
-        assert_eq!(clean("abcdef", 3), "abc");
     }
 }

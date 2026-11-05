@@ -7,7 +7,7 @@ export TZ=UTC
 umask 022
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-version=0.1.0
+version=0.2.0
 name=ktop
 rpmbuild=${RPMBUILD:-rpmbuild}
 output=${RPM_OUTPUT_DIR:-"$root/dist"}

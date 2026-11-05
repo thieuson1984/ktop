@@ -4,7 +4,7 @@
 %global __os_install_post %{nil}
 
 Name:           ktop
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Tiny Linux terminal system monitor
 License:        MIT
@@ -32,5 +32,9 @@ install -Dpm 0755 prebuilt/ktop %{buildroot}%{_bindir}/ktop
 %{_bindir}/ktop
 
 %changelog
+* Thu Nov 05 2026 ktop maintainers - 0.2.0-1
+- Add responsive card-based terminal dashboard and hardware inventory.
+- Retain MIT licensing and the static, dependency-light release.
+
 * Thu Nov 05 2026 ktop maintainers - 0.1.0-1
 - Initial prebuilt release package.

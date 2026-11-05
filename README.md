@@ -1,8 +1,8 @@
 # ktop
 
-A small, read-only Linux system monitor with a terminal interface. Written in
-Rust; reads kernel counters directly, without a service, sensor daemon, vendor
-SDK, or external runtime commands. MIT licensed.
+A small, read-only Linux system monitor with a card-based terminal interface.
+Written in Rust; reads kernel counters directly, without a service, sensor daemon,
+vendor SDK, or external runtime commands. [MIT licensed](LICENSE).
 
 ## Status displayed
 
@@ -30,10 +30,20 @@ exclude guest-time double counting and treat I/O wait as idle.
 
 ## Run
 
-Use a Linux terminal supporting ANSI cursor positioning and the alternate screen.
-The minimum terminal size is 42 columns by 12 rows; wider terminals show more
-columns. Long rows are clipped. The hardware page allows scrolling through all
-readable sensors.
+Use a UTF-8 Linux terminal supporting ANSI cursor positioning, the alternate
+screen, and single-column box-drawing characters. The minimum terminal size is
+42 columns by 12 rows.
+
+The dashboard uses bordered cards, aligned values, utilization meters, an active
+view tab, and a dedicated process table. Spacious terminals add a CPU-core card;
+narrow or short terminals collapse to a compact system card and process list.
+The hardware view has temperature/voltage/power cards plus a scrollable inventory
+of GPU counters, sensors, and every CPU core. Overflowing labels use an ellipsis;
+numeric columns retain their own space instead of shifting neighboring content.
+
+Colors use the terminal's palette and default background. `NO_COLOR=1` disables
+styling; active tabs, status labels, numeric values, and card borders remain
+readable without color. Compact `K/M/G/T` labels mean KiB/MiB/GiB/TiB.
 
 ```sh
 ktop
@@ -96,9 +106,9 @@ scripts/build-rpm.sh
 
 Outputs in `dist/`:
 
-- `ktop-0.1.0-1.fc45.x86_64.rpm` — installable unsigned binary RPM.
-- `ktop-0.1.0-1.fc45.src.rpm` — packaging/source RPM, including the prebuilt binary.
-- `ktop-0.1.0.tar.gz` — normalized source archive with the prebuilt binary.
+- `ktop-0.2.0-1.fc45.x86_64.rpm` — installable unsigned binary RPM.
+- `ktop-0.2.0-1.fc45.src.rpm` — packaging/source RPM, including the prebuilt binary.
+- `ktop-0.2.0.tar.gz` — normalized source archive with the prebuilt binary.
 
 This is **prebuilt-binary packaging**, not a Fedora distribution submission or a
 source-compiling Fedora SRPM. The spec installs the binary, README, and license
@@ -106,7 +116,7 @@ only: no daemon, scripts run at installation, or configuration files.
 Packaging requires no root. Installation requires administrator privileges:
 
 ```sh
-sudo dnf install ./dist/ktop-0.1.0-1.fc45.x86_64.rpm
+sudo dnf install ./dist/ktop-0.2.0-1.fc45.x86_64.rpm
 ```
 
 `RPMBUILD` selects a different rpmbuild executable; `RPM_OUTPUT_DIR` selects the
@@ -127,6 +137,14 @@ Only source, packaging scripts, and generic documentation belong in Git.
 Build output and RPMs are ignored. Release archives use an explicit input list,
 normalized ownership, and build-path remapping. Commit identities should use a
 GitHub noreply address, not a workstation's local Git identity.
+
+## Release 0.2.0
+
+Responsive, card-based dashboard with rounded borders, utilization meters,
+aligned metric readouts, selected-view tabs, and a bordered process table.
+Hardware counters use individually labeled rows; the inventory also exposes
+every CPU core. Terminal cells are reused between frames, no dependencies were
+added, and the release retains the MIT license.
 
 ## Release 0.1.0
 
