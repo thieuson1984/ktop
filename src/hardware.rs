@@ -1,8 +1,7 @@
 //! Bounded, best-effort Linux hwmon and DRM reads; no vendor libraries or subprocesses.
 
-use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const MAX_DIRECTORY_ENTRIES: usize = 512;
@@ -18,8 +17,18 @@ pub struct Hardware {
 
 impl Hardware {
     pub fn collect() -> Self {
+        Self::collect_from(Path::new("/sys/class/hwmon"), Path::new("/sys/class/drm"))
+    }
+
+    fn collect_from(hwmon_root: &Path, drm_root: &Path) -> Self {
         let mut groups: [Vec<String>; 4] = std::array::from_fn(|_| Vec::new());
-        for directory in numbered_directories(Path::new("/sys/class/hwmon"), "hwmon", MAX_HWMON) {
+        for directory in numbered_directories(hwmon_root, "hwmon", MAX_HWMON) {
+            if groups
+                .iter()
+                .all(|group| group.len() >= MAX_SENSORS_PER_KIND)
+            {
+                break;
+            }
             let driver = read_text(&directory.join("name"))
                 .map(|name| ascii_name(&name))
                 .filter(|name| !name.is_empty())
@@ -45,7 +54,7 @@ impl Hardware {
             }
         }
         let sensors = groups.into_iter().flatten().collect();
-        let gpus = numbered_directories(Path::new("/sys/class/drm"), "card", MAX_CARDS)
+        let gpus = numbered_directories(drm_root, "card", MAX_CARDS)
             .into_iter()
             .map(|card| gpu_line(&card))
             .collect();
@@ -88,11 +97,11 @@ fn numbered_name(name: &str, prefix: &str) -> Option<u32> {
     number.parse().ok()
 }
 
-fn channels(directory: &Path) -> BTreeSet<(SensorKind, String)> {
+fn channels(directory: &Path) -> Vec<(SensorKind, String)> {
     let Ok(entries) = fs::read_dir(directory) else {
-        return BTreeSet::new();
+        return Vec::new();
     };
-    entries
+    let mut channels: Vec<_> = entries
         .take(MAX_DIRECTORY_ENTRIES)
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -100,7 +109,10 @@ fn channels(directory: &Path) -> BTreeSet<(SensorKind, String)> {
             let (kind, channel) = sensor_channel(name.to_str()?)?;
             Some((kind, channel.to_owned()))
         })
-        .collect()
+        .collect();
+    channels.sort_unstable();
+    channels.dedup();
+    channels
 }
 
 fn sensor_channel(name: &str) -> Option<(SensorKind, &str)> {
@@ -121,6 +133,15 @@ fn sensor_channel(name: &str) -> Option<(SensorKind, &str)> {
 }
 
 fn read_sensor(directory: &Path, kind: SensorKind, channel: &str) -> Option<String> {
+    // A numeric input remains readable on some failed/disabled devices. The
+    // hwmon ABI says those readings must not be trusted.
+    for (suffix, expected) in [("enable", 1_u8), ("fault", 0_u8)] {
+        match read_text_result(&directory.join(format!("{channel}_{suffix}"))) {
+            Ok(value) if value.trim().parse::<u8>().ok() == Some(expected) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+    }
     let input = || read_text(&directory.join(format!("{channel}_input")));
     if kind == SensorKind::Power {
         // Average and instantaneous readings describe the same channel. Prefer the
@@ -183,7 +204,8 @@ fn gpu_line(card: &Path) -> String {
         }
         _ => "unavailable".to_owned(),
     };
-    let frequency = gpu_frequency(card, &device)
+    let hwmons = numbered_directories(&device.join("hwmon"), "hwmon", 4);
+    let frequency = gpu_frequency(card, &device, &hwmons)
         .map(|value| format!("{value} MHz"))
         .unwrap_or_else(|| "unavailable".to_owned());
     let mut line = format!("{vendor} {name}: busy {busy} | VRAM {memory} | freq {frequency}");
@@ -191,12 +213,12 @@ fn gpu_line(card: &Path) -> String {
     // exposes no utilization or VRAM counters (common without vendor libraries).
     let mut temperature = None;
     let mut power = None;
-    for hwmon in numbered_directories(&device.join("hwmon"), "hwmon", 4) {
-        for (kind, channel) in channels(&hwmon) {
+    for hwmon in &hwmons {
+        for (kind, channel) in channels(hwmon) {
             if kind == SensorKind::Temperature && temperature.is_none() {
-                temperature = read_sensor(&hwmon, kind, &channel);
+                temperature = read_sensor(hwmon, kind, &channel);
             } else if kind == SensorKind::Power && power.is_none() {
-                power = read_sensor(&hwmon, kind, &channel);
+                power = read_sensor(hwmon, kind, &channel);
             }
             if temperature.is_some() && power.is_some() {
                 break;
@@ -207,15 +229,17 @@ fn gpu_line(card: &Path) -> String {
         }
     }
     if let Some(value) = temperature {
-        line.push_str(&format!(" | {value}"));
+        line.push_str(" | ");
+        line.push_str(&value);
     }
     if let Some(value) = power {
-        line.push_str(&format!(" | {value}"));
+        line.push_str(" | ");
+        line.push_str(&value);
     }
     line
 }
 
-fn gpu_frequency(card: &Path, device: &Path) -> Option<u64> {
+fn gpu_frequency(card: &Path, device: &Path, hwmons: &[PathBuf]) -> Option<u64> {
     // i915: MHz, both the older card-level files and the per-GT interface.
     for relative in [
         "gt_act_freq_mhz",
@@ -235,6 +259,16 @@ fn gpu_frequency(card: &Path, device: &Path) -> Option<u64> {
                     return Some(value);
                 }
             }
+        }
+    }
+    // amdgpu's hwmon gfx clock is in Hz, unlike the MHz DRM interfaces.
+    // Do not mistake another driver's freq1 channel (possibly memory) for gfx.
+    for hwmon in hwmons {
+        if read_text(&hwmon.join("name")).as_deref().map(str::trim) != Some("amdgpu") {
+            continue;
+        }
+        if let Some(hz) = read_u64(&hwmon.join("freq1_input")) {
+            return Some(hz / 1_000_000);
         }
     }
     // amdgpu lists the supported states with an asterisk on the active state.
@@ -262,14 +296,22 @@ fn read_u64(path: &Path) -> Option<u64> {
 }
 
 fn read_text(path: &Path) -> Option<String> {
+    read_text_result(path).ok()
+}
+
+fn read_text_result(path: &Path) -> io::Result<String> {
     let mut text = String::new();
     // Read one byte beyond the bound so a truncated value cannot become valid.
-    File::open(path)
-        .ok()?
+    File::open(path)?
         .take(MAX_VALUE_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    (text.len() <= MAX_VALUE_BYTES as usize).then_some(text)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_VALUE_BYTES as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sysfs value exceeds read limit",
+        ));
+    }
+    Ok(text)
 }
 
 fn ascii_name(input: &str) -> String {
@@ -290,6 +332,39 @@ fn ascii_name(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let root = std::env::temp_dir().join(format!(
+                    "ktop-hardware-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed),
+                ));
+                match fs::create_dir(&root) {
+                    Ok(()) => return Self(root),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot create synthetic sysfs fixture: {error}"),
+                }
+            }
+        }
+
+        fn put(&self, relative: &str, value: impl AsRef<[u8]>) {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, value).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn drm_cards_exclude_connectors_and_render_nodes() {
@@ -396,5 +471,120 @@ mod tests {
     fn labels_are_bounded_ascii() {
         assert_eq!(ascii_name("  CPU\n\u{1b}温度  "), "CPU????");
         assert_eq!(ascii_name(&"x".repeat(100)).len(), 40);
+    }
+
+    #[test]
+    fn failed_disabled_or_unreadable_status_sensors_are_not_trusted() {
+        let fixture = Fixture::new();
+        fixture.put("hwmon0/temp1_input", "42000\n");
+        let directory = fixture.0.join("hwmon0");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1").as_deref(),
+            Some("42.0 C")
+        );
+        fixture.put("hwmon0/temp1_enable", "0\n");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1"),
+            None
+        );
+        fixture.put("hwmon0/temp1_enable", "1\n");
+        fixture.put("hwmon0/temp1_fault", "1\n");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1"),
+            None
+        );
+        fixture.put("hwmon0/temp1_fault", "0\n");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1").as_deref(),
+            Some("42.0 C")
+        );
+        fixture.put("hwmon0/temp1_fault", "invalid\n");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1"),
+            None
+        );
+        fs::remove_file(directory.join("temp1_fault")).unwrap();
+        fs::create_dir(directory.join("temp1_fault")).unwrap();
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Temperature, "temp1"),
+            None
+        );
+    }
+
+    #[test]
+    fn power_channel_is_deduplicated_and_falls_back_only_to_valid_input() {
+        let fixture = Fixture::new();
+        fixture.put("hwmon0/power1_input", "12500000\n");
+        fixture.put("hwmon0/power1_average", "invalid\n");
+        let directory = fixture.0.join("hwmon0");
+        assert_eq!(channels(&directory).len(), 1);
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Power, "power1").as_deref(),
+            Some("12.50 W")
+        );
+        fixture.put("hwmon0/power1_average", "25000000\n");
+        assert_eq!(
+            read_sensor(&directory, SensorKind::Power, "power1").as_deref(),
+            Some("25.00 W")
+        );
+    }
+
+    #[test]
+    fn amdgpu_hwmon_clock_uses_hertz_and_does_not_claim_other_driver_channels() {
+        let fixture = Fixture::new();
+        fixture.put("card0/device/hwmon/hwmon0/name", "amdgpu\n");
+        fixture.put("card0/device/hwmon/hwmon0/freq1_input", "1234500000\n");
+        let card = fixture.0.join("card0");
+        let device = card.join("device");
+        let hwmons = numbered_directories(&device.join("hwmon"), "hwmon", 4);
+        assert_eq!(gpu_frequency(&card, &device, &hwmons), Some(1234));
+        fixture.put("card0/device/hwmon/hwmon0/name", "other_driver\n");
+        assert_eq!(gpu_frequency(&card, &device, &hwmons), None);
+        fixture.put("card0/device/pp_dpm_sclk", "0: 500Mhz\n1: 900Mhz *\n");
+        assert_eq!(gpu_frequency(&card, &device, &hwmons), Some(900));
+    }
+
+    #[test]
+    fn intel_i915_and_xe_frequency_paths_are_read_as_megahertz() {
+        let fixture = Fixture::new();
+        fixture.put("card0/device/tile1/gt2/freq0/act_freq", "1350\n");
+        let card = fixture.0.join("card0");
+        let device = card.join("device");
+        assert_eq!(gpu_frequency(&card, &device, &[]), Some(1350));
+        fixture.put("card0/gt/gt0/rps_act_freq_mhz", "725\n");
+        assert_eq!(gpu_frequency(&card, &device, &[]), Some(725));
+    }
+
+    #[test]
+    fn removed_hardware_and_failed_counters_are_not_retained() {
+        let fixture = Fixture::new();
+        fixture.put("hwmon/hwmon0/name", "synthetic\n");
+        fixture.put("hwmon/hwmon0/temp1_input", "42000\n");
+        fixture.put("drm/card0/device/vendor", "0x1002\n");
+        fixture.put("drm/card0/device/gpu_busy_percent", "101\n");
+        fixture.put("drm/card0/device/mem_info_vram_used", "3\n");
+        fixture.put("drm/card0/device/mem_info_vram_total", "2\n");
+        let hwmon = fixture.0.join("hwmon");
+        let drm = fixture.0.join("drm");
+        let first = Hardware::collect_from(&hwmon, &drm);
+        assert_eq!(first.sensors, ["synthetic/temp1: 42.0 C"]);
+        assert_eq!(first.gpus.len(), 1);
+        assert!(first.gpus[0].contains("busy unavailable | VRAM unavailable"));
+        fs::remove_file(hwmon.join("hwmon0/temp1_input")).unwrap();
+        fs::remove_dir_all(drm.join("card0")).unwrap();
+        let next = Hardware::collect_from(&hwmon, &drm);
+        assert!(next.sensors.is_empty() && next.gpus.is_empty());
+    }
+
+    #[test]
+    fn oversized_and_non_utf8_sysfs_values_do_not_become_valid_prefixes() {
+        let fixture = Fixture::new();
+        fixture.put(
+            "value",
+            format!("1{}", " ".repeat(MAX_VALUE_BYTES as usize)),
+        );
+        assert_eq!(read_u64(&fixture.0.join("value")), None);
+        fixture.put("value", b"42\xff");
+        assert_eq!(read_u64(&fixture.0.join("value")), None);
     }
 }
