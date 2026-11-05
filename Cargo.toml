@@ -1,0 +1,18 @@
+[package]
+name = "ktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Small, read-only Linux system monitor for the terminal"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
