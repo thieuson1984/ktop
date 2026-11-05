@@ -374,7 +374,7 @@ impl Frame {
             "q Quit   1-3 Views   j/k Scroll"
         };
         self.text(2, self.height - 1, self.width - 4, footer, Style::Muted);
-        if view.page == 3 && !view.tasks.filter.is_empty() {
+        if view.page != 2 && !view.tasks.filter.is_empty() {
             self.message(
                 &format!(
                     "FILTER: {} | {} matches | / Edit",
