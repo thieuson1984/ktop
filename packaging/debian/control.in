@@ -1,0 +1,13 @@
+Package: ktop
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: ktop contributors <ktop@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/thieuson1984/ktop
+Description: compact Linux terminal system monitor and process manager
+ Displays live CPU, memory, network, storage and process information directly
+ from Linux procfs and sysfs, with interactive process-management controls.
+ This package contains a statically linked executable with no shared-library
+ runtime dependencies. It does not install a daemon or privileged helper.

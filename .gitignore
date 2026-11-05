@@ -1,6 +1,7 @@
 /target/
 /dist/
 *.rpm
+*.deb
 .env
 .env.*
 *.log

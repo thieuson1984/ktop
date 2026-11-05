@@ -1,0 +1,51 @@
+ktop
+Upstream: https://github.com/thieuson1984/ktop
+Copyright (c) 2026 ktop contributors
+License: MIT (application code and Debian packaging)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Bundled components
+------------------
+The executable is statically linked. The MIT notice above applies to ktop;
+it does not replace the copyright and license terms of bundled components.
+The package includes their full notices under /usr/share/doc/ktop/licenses:
+
+  LICENSE-ktop
+    Unmodified upstream application MIT license.
+
+  libc/LICENSE-MIT
+  libc/LICENSE-APACHE
+    Full copyright and license notices from the locked Rust libc crate
+    (MIT OR Apache-2.0).
+
+  rust/COPYRIGHT-library.html.gz
+    Full Rust standard-library copyright and license notices, including its
+    bundled third-party notices. Read with gzip -dc or zcat.
+
+  rust/COPYRIGHT-distribution.html.gz
+    Full matching Rust distribution copyright and license notices, including
+    the musl C runtime objects bundled by the Rust musl target. Read with
+    gzip -dc or zcat.
+
+  rust/TOOLCHAIN
+    Compiler version identifying the Rust distribution used for the build.
+
+These full notices are supplied with the canonical standalone release binary;
+packaging preserves the executable and notice contents without rebuilding.
