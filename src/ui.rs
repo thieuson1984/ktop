@@ -2,8 +2,10 @@
 //! untrusted procfs/sysfs data; each glyph occupies exactly one terminal column.
 use crate::{
     Sort,
+    control::{Identity, Pending},
     hardware::Hardware,
-    system::{Process, System},
+    system::System,
+    tasks::Tasks,
 };
 use std::{fmt::Write as _, time::Duration};
 
@@ -35,15 +37,22 @@ impl Style {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Cell {
-    glyph: char,
+    // Drawing glyphs are BMP; dynamic text is printable ASCII. Two compact
+    // frame buffers therefore cost no more per cell than the old single buffer.
+    glyph: u16,
     style: Style,
+}
+impl Cell {
+    fn glyph(self) -> char {
+        char::from_u32(u32::from(self.glyph)).unwrap_or('?')
+    }
 }
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            glyph: ' ',
+            glyph: u16::from(b' '),
             style: Style::Text,
         }
     }
@@ -61,12 +70,13 @@ impl Rect {
     }
 }
 #[derive(Clone, Copy)]
-pub(super) struct View {
+pub(super) struct View<'a> {
     pub sort: Sort,
     pub offset: usize,
     pub page: u8,
     pub paused: bool,
     pub interval: Duration,
+    pub tasks: &'a Tasks,
 }
 
 pub(super) struct Frame {
@@ -74,6 +84,8 @@ pub(super) struct Frame {
     height: usize,
     cells: Vec<Cell>,
     color: bool,
+    previous: Vec<Cell>,
+    previous_size: (usize, usize),
 }
 impl Frame {
     pub fn new(width: usize, height: usize) -> Self {
@@ -82,16 +94,123 @@ impl Frame {
             height,
             cells: vec![Cell::default(); width * height],
             color: std::env::var_os("NO_COLOR").is_none(),
+            previous: Vec::new(),
+            previous_size: (0, 0),
         }
     }
     pub fn resize(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;
         self.cells.resize(width * height, Cell::default());
+        self.previous.resize(width * height, Cell::default());
+        if self.cells.capacity() > 8192 && self.cells.len() < self.cells.capacity() / 4 {
+            self.cells.shrink_to_fit();
+            self.previous.shrink_to(width * height);
+        }
+    }
+    pub fn invalidate(&mut self) {
+        self.previous_size = (0, 0);
+    }
+    pub fn output_budget(&self) -> usize {
+        (self.width * self.height * 4).max(8192)
+    }
+    fn process_rect(&self, page: u8) -> Rect {
+        let start = if self.height >= 18 { 3 } else { 2 };
+        let y = if page == 3 {
+            start
+                + if self.width >= 72 && self.height >= 24 {
+                    7
+                } else {
+                    0
+                }
+        } else if self.width < 72 || self.height < 22 {
+            start
+                + if self.height < 16 {
+                    3
+                } else if self.height < 22 {
+                    4
+                } else {
+                    6
+                }
+                + 1
+        } else {
+            start + 8 + if self.height >= 30 { 8 } else { 5 }
+        };
+        Rect {
+            x: 1,
+            y,
+            w: self.width.saturating_sub(2),
+            h: self.height.saturating_sub(y + 1),
+        }
+    }
+    pub fn visible_processes(&self, page: u8) -> usize {
+        if self.width < 41 || self.height < 12 {
+            0
+        } else {
+            self.process_rect(page).h.saturating_sub(4)
+        }
+    }
+    pub fn message(&mut self, text: &str, error: bool) {
+        let y = if self.height >= 18 {
+            2
+        } else {
+            self.height.saturating_sub(1)
+        };
+        for x in 0..self.width {
+            self.put(x, y, ' ', Style::Text);
+        }
+        self.text(
+            1,
+            y,
+            self.width.saturating_sub(2),
+            text,
+            if error { Style::Error } else { Style::Accent },
+        );
+    }
+    pub fn confirmation(&mut self, pending: &Pending) {
+        let w = self.width.saturating_sub(4).min(76);
+        let h = 8.min(self.height);
+        let r = Rect {
+            x: self.width.saturating_sub(w) / 2,
+            y: self.height.saturating_sub(h) / 2,
+            w,
+            h,
+        };
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                self.put(x, y, ' ', Style::Text);
+            }
+        }
+        self.card(r, "CONFIRM PROCESS ACTION", "");
+        self.text(
+            r.x + 2,
+            r.y + 1,
+            r.width(),
+            &format!("{} PID {}", pending.action.label(), pending.identity.pid),
+            Style::Warning,
+        );
+        self.text(r.x + 2, r.y + 2, r.width(), &pending.name, Style::Title);
+        self.text(
+            r.x + 2,
+            r.y + 4,
+            r.width(),
+            pending.action.warning(),
+            Style::Text,
+        );
+        self.text(
+            r.x + 2,
+            r.y + 6,
+            r.width(),
+            "y Confirm | Esc / n Cancel",
+            Style::Accent,
+        );
     }
     fn put(&mut self, x: usize, y: usize, glyph: char, style: Style) {
         if x < self.width && y < self.height {
-            self.cells[y * self.width + x] = Cell { glyph, style };
+            self.cells[y * self.width + x] = Cell {
+                glyph: u16::try_from(glyph as u32).unwrap_or(u16::from(b'?')),
+                style,
+            };
         }
     }
     fn text(&mut self, x: usize, y: usize, width: usize, text: &str, style: Style) {
@@ -241,7 +360,13 @@ impl Frame {
             3 => self.process_page(s, view, start),
             _ => self.overview(s, h, view, start),
         }
-        let footer = if self.width >= 100 {
+        let footer = if view.page == 3 {
+            if self.width >= 100 {
+                "q Quit  / Filter  j/k Select  t Terminate  K Kill  s Suspend  r Resume"
+            } else {
+                "q Quit  / Filter  t/K/s/r Actions"
+            }
+        } else if self.width >= 100 {
             "q Quit   1-3 Views   c/m/p Sort   j/k Scroll   Space Pause   +/- Refresh"
         } else if self.width >= 70 {
             "q Quit  1-3 Views  c/m/p Sort  j/k Scroll  Space Pause  +/- Rate"
@@ -249,6 +374,16 @@ impl Frame {
             "q Quit   1-3 Views   j/k Scroll"
         };
         self.text(2, self.height - 1, self.width - 4, footer, Style::Muted);
+        if view.page == 3 && !view.tasks.filter.is_empty() {
+            self.message(
+                &format!(
+                    "FILTER: {} | {} matches | / Edit",
+                    view.tasks.filter,
+                    view.tasks.len()
+                ),
+                false,
+            );
+        }
         if let Some(error) = &s.error {
             // Keep failures visible regardless of the selected page or card density.
             let y = if self.height >= 18 {
@@ -334,22 +469,20 @@ impl Frame {
                 h: height,
             };
             self.card(r, "SYSTEM", "");
-            let cpu = s.cpu.first().copied().unwrap_or(0.0);
+            let cpu = s.cpu.first().copied();
             self.pair(
                 r,
                 0,
                 "CPU / RAM",
-                &format!("{cpu:.1}% / {:.1}%", percent(s.memory_used, s.memory_total)),
+                &format!(
+                    "{} / {}",
+                    usage(cpu),
+                    usage((s.memory_total > 0).then(|| percent(s.memory_used, s.memory_total)))
+                ),
                 Style::Accent,
             );
             if height >= 4 {
-                self.pair(
-                    r,
-                    1,
-                    "Memory",
-                    &format!("{} / {}", bytes(s.memory_used), bytes(s.memory_total)),
-                    Style::Text,
-                );
+                self.pair(r, 1, "Memory", &memory_pair(s), Style::Text);
             }
             if height >= 6 {
                 let root = s
@@ -366,16 +499,7 @@ impl Frame {
                     Style::Text,
                 );
             }
-            self.processes(
-                s,
-                view,
-                Rect {
-                    x: 1,
-                    y: y + height + 1,
-                    w: self.width - 2,
-                    h: self.height.saturating_sub(y + height + 2),
-                },
-            );
+            self.processes(s, view, self.process_rect(view.page));
             return;
         }
         self.summary(s, y);
@@ -391,17 +515,7 @@ impl Frame {
             self.hardware_brief(h, hardware);
             self.traffic(s, traffic);
         }
-        let processes_y = secondary_y + secondary_height + 1;
-        self.processes(
-            s,
-            view,
-            Rect {
-                x: 1,
-                y: processes_y,
-                w: self.width - 2,
-                h: self.height.saturating_sub(processes_y + 1),
-            },
-        );
+        self.processes(s, view, self.process_rect(view.page));
     }
     fn summary(&mut self, s: &System, y: usize) {
         let cards = self.columns::<3>(y, 6);
@@ -411,27 +525,39 @@ impl Frame {
             let (title, value, detail, amount, note) = match i {
                 0 => (
                     "PROCESSOR",
-                    format!("{cpu:.1}%"),
-                    format!(
-                        "{} cores | {}",
-                        s.cpu.len().saturating_sub(1),
-                        s.mhz
-                            .map(|v| format!("{v} MHz"))
-                            .unwrap_or_else(|| "clock N/A".into())
-                    ),
+                    usage(s.cpu.first().copied()),
+                    if s.cpu.is_empty() {
+                        "Counters unavailable".into()
+                    } else {
+                        format!(
+                            "{} cores | {}",
+                            s.cpu.len().saturating_sub(1),
+                            s.mhz
+                                .map(|v| format!("{v} MHz"))
+                                .unwrap_or_else(|| "clock N/A".into())
+                        )
+                    },
                     cpu,
-                    format!("Load {}", s.load),
+                    if s.load.is_empty() {
+                        "Load N/A".into()
+                    } else {
+                        format!("Load {}", s.load)
+                    },
                 ),
                 1 => (
                     "MEMORY",
-                    format!("{memory:.1}%"),
-                    format!("{} / {}", bytes(s.memory_used), bytes(s.memory_total)),
+                    usage((s.memory_total > 0).then_some(memory)),
+                    memory_pair(s),
                     memory,
-                    format!(
-                        "Swap {} / {}",
-                        bytes_short(s.swap_used),
-                        bytes_short(s.swap_total)
-                    ),
+                    if s.memory_total > 0 {
+                        format!(
+                            "Swap {} / {}",
+                            bytes_short(s.swap_used),
+                            bytes_short(s.swap_total)
+                        )
+                    } else {
+                        "Swap N/A".into()
+                    },
                 ),
                 _ => match s.disk_space {
                     Some((used, total)) => (
@@ -476,7 +602,13 @@ impl Frame {
             let width = r.width() / per_row;
             let x = r.x + 2 + (i % per_row) * width;
             let y = r.y + 1 + i / per_row;
-            self.text(x, y, 4, &format!("{:02}", i), Style::Muted);
+            self.text(
+                x,
+                y,
+                4,
+                &format!("{:02}", s.cpu_ids.get(i).copied().unwrap_or(i as u32)),
+                Style::Muted,
+            );
             self.meter(x + 4, y, width.saturating_sub(12), *value);
             self.right(
                 x,
@@ -548,8 +680,20 @@ impl Frame {
     fn traffic(&mut self, s: &System, r: Rect) {
         self.card(r, "TRAFFIC", "bytes / s");
         let (rx, tx) = network_rates(s);
-        self.pair(r, 0, "NET RX", &format!("{}/s", bytes(rx)), Style::Text);
-        self.pair(r, 1, "NET TX", &format!("{}/s", bytes(tx)), Style::Text);
+        self.pair(
+            r,
+            0,
+            "NET RX",
+            &rate((!s.network.is_empty()).then_some(rx)),
+            Style::Text,
+        );
+        self.pair(
+            r,
+            1,
+            "NET TX",
+            &rate((!s.network.is_empty()).then_some(tx)),
+            Style::Text,
+        );
         let read = s.disks.iter().map(|d| d.read).sum::<f64>() as u64;
         let write = s.disks.iter().map(|d| d.write).sum::<f64>() as u64;
         if r.h >= 8 {
@@ -558,14 +702,14 @@ impl Frame {
                 r,
                 3,
                 "DISK READ",
-                &format!("{}/s", bytes(read)),
+                &rate((!s.disks.is_empty()).then_some(read)),
                 Style::Text,
             );
             self.pair(
                 r,
                 4,
                 "DISK WRITE",
-                &format!("{}/s", bytes(write)),
+                &rate((!s.disks.is_empty()).then_some(write)),
                 Style::Text,
             );
             self.pair(
@@ -580,35 +724,27 @@ impl Frame {
                 r,
                 2,
                 "DISK R/W",
-                &format!("{}/{}", bytes(read), bytes(write)),
+                &if s.disks.is_empty() {
+                    "N/A".into()
+                } else {
+                    format!("{}/{}", bytes(read), bytes(write))
+                },
                 Style::Text,
             );
         }
     }
     fn process_page(&mut self, s: &System, view: View, y: usize) {
-        let top = if self.width >= 72 && self.height >= 24 {
+        if self.width >= 72 && self.height >= 24 {
             self.summary(s, y);
-            y + 7
-        } else {
-            y
-        };
-        self.processes(
-            s,
-            view,
-            Rect {
-                x: 1,
-                y: top,
-                w: self.width - 2,
-                h: self.height.saturating_sub(top + 1),
-            },
-        );
+        }
+        self.processes(s, view, self.process_rect(view.page));
     }
     fn processes(&mut self, s: &System, view: View, r: Rect) {
         if r.h < 4 {
             return;
         }
         let capacity = r.h - 4;
-        let count = s.processes.len();
+        let count = view.tasks.len();
         let end = (view.offset + capacity).min(count);
         let aside = format!(
             "{}-{} / {}",
@@ -663,54 +799,63 @@ impl Frame {
             self.right(rss_x + 11, header_y, 5, "THR", Style::Muted);
         }
         self.line(r.x + 1, r.y + 2, r.w - 2, '─');
-        let mut processes: Vec<&Process> = s.processes.values().collect();
-        processes.sort_unstable_by(|a, b| match view.sort {
-            Sort::Cpu => b
-                .cpu
-                .total_cmp(&a.cpu)
-                .then_with(|| b.rss.cmp(&a.rss))
-                .then_with(|| a.pid.cmp(&b.pid)),
-            Sort::Memory => b.rss.cmp(&a.rss).then_with(|| a.pid.cmp(&b.pid)),
-            Sort::Pid => a.pid.cmp(&b.pid),
-        });
-        for (i, p) in processes
-            .into_iter()
-            .skip(view.offset)
-            .take(capacity)
-            .enumerate()
-        {
+        for i in 0..capacity {
+            let Some(p) = view.tasks.at(s, view.offset + i) else {
+                break;
+            };
             let y = r.y + 3 + i;
-            self.right(x, y, 7, &p.pid.to_string(), Style::Muted);
-            self.text(name_x, y, name_width, &p.name, Style::Text);
+            let selected = view.page == 3 && view.tasks.selected == Some(Identity::of(p));
+            let text_style = if selected { Style::Active } else { Style::Text };
+            let muted = if selected {
+                Style::Active
+            } else {
+                Style::Muted
+            };
+            if selected {
+                for col in r.x + 1..r.x + r.w - 1 {
+                    self.put(col, y, ' ', Style::Active);
+                }
+                self.put(r.x + 1, y, '>', Style::Active);
+            }
+            self.right(x, y, 7, &p.pid.to_string(), muted);
+            self.text(name_x, y, name_width, &p.name, text_style);
             self.right(
                 cpu_x,
                 y,
                 7,
                 &format!("{:.1}", p.cpu),
-                if p.cpu >= 1.0 {
+                if selected {
+                    Style::Active
+                } else if p.cpu >= 1.0 {
                     usage_style(p.cpu)
                 } else {
                     Style::Text
                 },
             );
-            self.right(rss_x, y, 9, &bytes(p.rss), Style::Text);
+            self.right(rss_x, y, 9, &bytes(p.rss), text_style);
             if wide {
                 self.put(
                     name_x + name_width + 2,
                     y,
-                    p.state,
-                    if p.state == 'R' {
+                    if p.state.is_ascii_graphic() {
+                        p.state
+                    } else {
+                        '?'
+                    },
+                    if selected {
+                        Style::Active
+                    } else if p.state == 'R' {
                         Style::Good
                     } else {
                         Style::Muted
                     },
                 );
-                self.right(rss_x + 11, y, 5, &p.threads.to_string(), Style::Muted);
+                self.right(rss_x + 11, y, 5, &p.threads.to_string(), muted);
             }
         }
         let hint = format!(" {} sort | 100% = one core ", view.sort.label());
         self.text(r.x + 2, r.y + r.h - 1, r.width(), &hint, Style::Muted);
-        if count == 0 {
+        if count == 0 && capacity > 0 {
             self.text(x, r.y + 3, r.width(), "No readable processes", Style::Muted);
         }
     }
@@ -790,7 +935,10 @@ impl Frame {
                 self.pair(
                     r,
                     row,
-                    &format!("CPU {core:02} usage"),
+                    &format!(
+                        "CPU {:02} usage",
+                        s.cpu_ids.get(core).copied().unwrap_or(core as u32)
+                    ),
                     &format!("{usage:.1}%"),
                     usage_style(*usage),
                 );
@@ -814,26 +962,41 @@ impl Frame {
         );
         self.text(r.x + 2, r.y + r.h - 1, r.width(), &hint, Style::Muted);
     }
-    pub fn write_ansi(&self, output: &mut String) {
+    pub fn write_ansi(&mut self, output: &mut String) {
         if self.width == 0 {
             return;
         }
+        let full = self.previous_size != (self.width, self.height);
+        if full {
+            output.push_str("\x1b[0m\x1b[2J");
+            self.previous.resize(self.cells.len(), Cell::default());
+        }
         for (y, row) in self.cells.chunks(self.width).enumerate() {
-            let _ = write!(output, "\x1b[{};1H", y + 1);
+            let previous = &self.previous[y * self.width..(y + 1) * self.width];
+            let changed = |i: usize| {
+                if full {
+                    row[i].glyph() != ' ' || row[i].style == Style::Active
+                } else {
+                    row[i] != previous[i]
+                }
+            };
+            let Some(first) = (0..row.len()).find(|i| changed(*i)) else {
+                continue;
+            };
+            let last = (first..row.len()).rfind(|i| changed(*i)).unwrap_or(first);
+            let _ = write!(output, "\x1b[{};{}H\x1b[0m", y + 1, first + 1);
             let mut style = Style::Text;
-            output.push_str("\x1b[0m");
-            for cell in row {
+            for cell in &row[first..=last] {
                 if self.color && style != cell.style {
                     output.push_str(cell.style.ansi());
                     style = cell.style;
                 }
-                output.push(cell.glyph);
+                output.push(cell.glyph());
             }
-            // Clear the reserved final column, including stale cells after resize,
-            // without erasing a whole row before its replacement is ready.
-            output.push_str("\x1b[0m\x1b[K");
+            output.push_str("\x1b[0m");
         }
-        output.push_str("\x1b[0m\x1b[J");
+        self.previous.copy_from_slice(&self.cells);
+        self.previous_size = (self.width, self.height);
     }
     pub fn write_plain(&self, output: &mut String) {
         if self.width == 0 {
@@ -842,10 +1005,10 @@ impl Frame {
         for row in self.cells.chunks(self.width) {
             let end = row
                 .iter()
-                .rposition(|c| c.glyph != ' ')
+                .rposition(|c| c.glyph() != ' ')
                 .map_or(0, |i| i + 1);
             for cell in &row[..end] {
-                output.push(cell.glyph);
+                output.push(cell.glyph());
             }
             output.push('\n');
         }
@@ -903,6 +1066,23 @@ fn bytes_short(value: u64) -> String {
     format!("{n:.1}{}", ["B", "K", "M", "G", "T"][unit])
 }
 
+fn usage(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "N/A".into())
+}
+fn memory_pair(s: &System) -> String {
+    if s.memory_total == 0 {
+        "N/A".into()
+    } else {
+        format!("{} / {}", bytes(s.memory_used), bytes(s.memory_total))
+    }
+}
+fn rate(value: Option<u64>) -> String {
+    value
+        .map(|v| format!("{}/s", bytes(v)))
+        .unwrap_or_else(|| "N/A".into())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,16 +1095,16 @@ mod tests {
         assert_eq!(plain, "bad?[2J?????\n");
         let mut ansi = String::new();
         frame.write_ansi(&mut ansi);
-        assert!(!ansi.contains("\x1b[2J"));
+        assert!(!ansi.contains("bad\x1b[2J"));
     }
     #[test]
     fn clipping_cannot_overwrite_a_neighboring_card() {
         let mut frame = Frame::new(20, 3);
         frame.text(1, 1, 5, "an overlong name", Style::Text);
         frame.put(6, 1, '│', Style::Border);
-        assert_eq!(frame.cells[20 + 6].glyph, '│');
-        assert_eq!(frame.cells[20 + 5].glyph, '…');
-        assert_eq!(frame.cells[20 + 7].glyph, ' ');
+        assert_eq!(frame.cells[20 + 6].glyph(), '│');
+        assert_eq!(frame.cells[20 + 5].glyph(), '…');
+        assert_eq!(frame.cells[20 + 7].glyph(), ' ');
     }
     #[test]
     fn process_columns_keep_borders_and_padding_at_responsive_boundaries() {
@@ -936,12 +1116,15 @@ mod tests {
         p.cpu = 1234.5;
         p.state = 'R';
         p.threads = 128;
+        let mut tasks = Tasks::default();
+        tasks.refresh(&system, Sort::Cpu);
         let view = View {
             sort: Sort::Cpu,
             offset: 0,
             page: 3,
             paused: false,
             interval: Duration::from_secs(1),
+            tasks: &tasks,
         };
         for width in [41, 42, 63, 71, 72, 79, 109, 110, 111] {
             let mut frame = Frame::new(width, 8);
@@ -957,10 +1140,10 @@ mod tests {
             );
             for y in [1, 3] {
                 let row = &frame.cells[y * width..(y + 1) * width];
-                assert_eq!(row[1].glyph, '│', "left border at width {width}");
-                assert_eq!(row[width - 2].glyph, '│', "right border at width {width}");
+                assert_eq!(row[1].glyph(), '│', "left border at width {width}");
+                assert_eq!(row[width - 2].glyph(), '│', "right border at width {width}");
                 assert_eq!(
-                    row[width - 3].glyph,
+                    row[width - 3].glyph(),
                     ' ',
                     "numeric padding at width {width}"
                 );
@@ -971,5 +1154,63 @@ mod tests {
             assert!(plain.contains("1234.5"));
             assert!(plain.contains("16.0 GiB"));
         }
+    }
+    #[test]
+    fn missing_counters_are_not_zero_measurements() {
+        let mut system = System::new();
+        let mut frame = Frame::new(110, 8);
+        frame.summary(&system, 0);
+        let mut text = String::new();
+        frame.write_plain(&mut text);
+        assert!(!text.contains("0.0%"));
+        assert!(!text.contains("0.0 B"));
+        system.cpu = vec![0.0, 0.0];
+        system.memory_total = 1024;
+        system.disk_space = Some((0, 1024));
+        frame.cells.fill(Cell::default());
+        frame.summary(&system, 0);
+        text.clear();
+        frame.write_plain(&mut text);
+        assert!(text.contains("0.0%"));
+        assert!(text.contains("0.0 B"));
+    }
+    #[test]
+    fn incremental_updates_erase_shortened_readouts() {
+        fn apply(output: &str, display: &mut [char]) {
+            let mut x = 0;
+            let mut chars = output.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' && chars.next() == Some('[') {
+                    let mut params = String::new();
+                    for cmd in chars.by_ref() {
+                        if cmd.is_ascii_alphabetic() {
+                            if cmd == 'J' && params == "2" {
+                                display.fill(' ');
+                            }
+                            if cmd == 'H' {
+                                x = params.split(';').nth(1).unwrap().parse::<usize>().unwrap() - 1;
+                            }
+                            break;
+                        }
+                        params.push(cmd);
+                    }
+                } else if x < display.len() {
+                    display[x] = c;
+                    x += 1;
+                }
+            }
+        }
+        let mut frame = Frame::new(10, 1);
+        let mut display = vec![' '; 10];
+        let mut output = String::new();
+        frame.text(0, 0, 10, "abcdef", Style::Text);
+        frame.write_ansi(&mut output);
+        apply(&output, &mut display);
+        frame.cells.fill(Cell::default());
+        frame.text(0, 0, 10, "x", Style::Text);
+        output.clear();
+        frame.write_ansi(&mut output);
+        apply(&output, &mut display);
+        assert_eq!(display.iter().collect::<String>(), "x         ");
     }
 }
