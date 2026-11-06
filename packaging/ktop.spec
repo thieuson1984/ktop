@@ -10,7 +10,7 @@
 %global rust_target %{_target_cpu}-unknown-linux-gnu
 
 Name:           ktop
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Tiny Linux terminal system monitor
 License:        MIT
@@ -82,6 +82,10 @@ install -Dpm 0755 target/%{rust_target}/release/ktop %{buildroot}%{_bindir}/ktop
 %{_bindir}/ktop
 
 %changelog
+* Fri Nov 06 2026 ktop maintainers - 0.4.0-1
+- Add reversible sorting for every process-table column with stable selection.
+- Refresh resource colors, selection highlights and visible sort indicators.
+
 * Thu Nov 05 2026 ktop maintainers - 0.3.0-1
 - Support native aarch64 source builds with complete unit and terminal checks.
 - Build the Fedora executable offline from complete vendored source.

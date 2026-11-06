@@ -1,7 +1,7 @@
 //! Small cell-based renderer. Geometry and styling never share a string with
 //! untrusted procfs/sysfs data; each glyph occupies exactly one terminal column.
 use crate::{
-    Sort,
+    Sort, SortOrder,
     control::{Identity, Pending},
     hardware::Hardware,
     system::System,
@@ -17,6 +17,8 @@ enum Style {
     Border,
     Title,
     Accent,
+    Memory,
+    Storage,
     Good,
     Warning,
     Error,
@@ -26,14 +28,16 @@ impl Style {
     fn ansi(self) -> &'static str {
         match self {
             Self::Text => "\x1b[0m",
-            Self::Muted => "\x1b[0;2m",
+            Self::Muted => "\x1b[0m",
             Self::Border => "\x1b[0;90m",
-            Self::Title => "\x1b[0;1m",
+            Self::Title => "\x1b[0;1;34m",
             Self::Accent => "\x1b[0;1;36m",
+            Self::Memory => "\x1b[0;35m",
+            Self::Storage => "\x1b[0;34m",
             Self::Good => "\x1b[0;32m",
-            Self::Warning => "\x1b[0;33m",
-            Self::Error => "\x1b[0;31m",
-            Self::Active => "\x1b[0;1;7m",
+            Self::Warning => "\x1b[0;1;33m",
+            Self::Error => "\x1b[0;1;31m",
+            Self::Active => "\x1b[0;1;30;46m",
         }
     }
 }
@@ -71,7 +75,7 @@ impl Rect {
 }
 #[derive(Clone, Copy)]
 pub(super) struct View<'a> {
-    pub sort: Sort,
+    pub sort: SortOrder,
     pub offset: usize,
     pub page: u8,
     pub paused: bool,
@@ -300,7 +304,7 @@ impl Frame {
         );
         self.right(r.x + 2, r.y + row + 1, width, value, style);
     }
-    fn meter(&mut self, x: usize, y: usize, width: usize, value: f64) {
+    fn meter(&mut self, x: usize, y: usize, width: usize, value: f64, style: Style) {
         let used = (value.clamp(0.0, 100.0) * width as f64 / 100.0).round() as usize;
         for i in 0..width {
             self.put(
@@ -308,7 +312,7 @@ impl Frame {
                 y,
                 if i < used { '━' } else { '─' },
                 if i < used {
-                    usage_style(value)
+                    if value >= 90.0 { Style::Warning } else { style }
                 } else {
                     Style::Border
                 },
@@ -367,9 +371,9 @@ impl Frame {
                 "q Quit  / Filter  t/K/s/r Actions"
             }
         } else if self.width >= 100 {
-            "q Quit   1-3 Views   c/m/p Sort   j/k Scroll   Space Pause   +/- Refresh"
+            "q Quit   1-3 Views   c/m/p/n/S/T Sort   o Reverse   Space Pause   +/- Refresh"
         } else if self.width >= 70 {
-            "q Quit  1-3 Views  c/m/p Sort  j/k Scroll  Space Pause  +/- Rate"
+            "q Quit  1-3 Views  c/m/p/n Sort  o Reverse  Space Pause"
         } else {
             "q Quit   1-3 Views   j/k Scroll"
         };
@@ -403,7 +407,7 @@ impl Frame {
     fn header(&mut self, s: &System, view: View) {
         self.text(1, 0, 4, "ktop", Style::Accent);
         if self.width >= 70 {
-            self.text(7, 0, 32, "SYSTEM MONITOR", Style::Muted);
+            self.text(7, 0, 32, "SYSTEM / RESOURCE MONITOR", Style::Muted);
         }
         let status = format!(
             "{}  {:.1}s ",
@@ -576,10 +580,18 @@ impl Frame {
                     ),
                 },
             };
+            let style = match i {
+                0 => Style::Accent,
+                1 => Style::Memory,
+                _ => Style::Storage,
+            };
             self.card(r, title, "");
-            self.text(r.x + 2, r.y + 1, r.width(), &value, Style::Title);
-            self.text(r.x + 2, r.y + 2, r.width(), &detail, Style::Muted);
-            self.meter(r.x + 2, r.y + 3, r.width(), amount);
+            for x in r.x + 2..r.x + 4 + title.len().min(r.width()) {
+                self.cells[r.y * self.width + x].style = style;
+            }
+            self.text(r.x + 2, r.y + 1, r.width(), &value, style);
+            self.text(r.x + 2, r.y + 2, r.width(), &detail, Style::Text);
+            self.meter(r.x + 2, r.y + 3, r.width(), amount, style);
             self.text(r.x + 2, r.y + 4, r.width(), &note, Style::Muted);
         }
     }
@@ -609,7 +621,7 @@ impl Frame {
                 &format!("{:02}", s.cpu_ids.get(i).copied().unwrap_or(i as u32)),
                 Style::Muted,
             );
-            self.meter(x + 4, y, width.saturating_sub(12), *value);
+            self.meter(x + 4, y, width.saturating_sub(12), *value, Style::Accent);
             self.right(
                 x,
                 y,
@@ -685,14 +697,14 @@ impl Frame {
             0,
             "NET RX",
             &rate((!s.network.is_empty()).then_some(rx)),
-            Style::Text,
+            Style::Accent,
         );
         self.pair(
             r,
             1,
             "NET TX",
             &rate((!s.network.is_empty()).then_some(tx)),
-            Style::Text,
+            Style::Memory,
         );
         let read = s.disks.iter().map(|d| d.read).sum::<f64>() as u64;
         let write = s.disks.iter().map(|d| d.write).sum::<f64>() as u64;
@@ -703,14 +715,14 @@ impl Frame {
                 3,
                 "DISK READ",
                 &rate((!s.disks.is_empty()).then_some(read)),
-                Style::Text,
+                Style::Accent,
             );
             self.pair(
                 r,
                 4,
                 "DISK WRITE",
                 &rate((!s.disks.is_empty()).then_some(write)),
-                Style::Text,
+                Style::Memory,
             );
             self.pair(
                 r,
@@ -760,43 +772,37 @@ impl Frame {
         let cpu_x = name_x + name_width + if wide { 5 } else { 2 };
         let rss_x = cpu_x + 9;
         let header_y = r.y + 1;
-        self.right(
-            x,
-            header_y,
-            7,
-            "PID",
-            if view.sort == Sort::Pid {
-                Style::Accent
-            } else {
-                Style::Muted
-            },
-        );
-        self.text(name_x, header_y, name_width, "NAME", Style::Muted);
-        self.right(
-            cpu_x,
-            header_y,
-            7,
-            "CPU %",
-            if view.sort == Sort::Cpu {
-                Style::Accent
-            } else {
-                Style::Muted
-            },
-        );
-        self.right(
-            rss_x,
-            header_y,
-            9,
-            "RSS",
-            if view.sort == Sort::Memory {
-                Style::Accent
-            } else {
-                Style::Muted
-            },
-        );
-        if wide {
-            self.text(name_x + name_width + 2, header_y, 1, "S", Style::Muted);
-            self.right(rss_x + 11, header_y, 5, "THR", Style::Muted);
+        for (col_x, width, label, column, right) in [
+            (x, 7, "PID", Sort::Pid, true),
+            (name_x, name_width, "NAME", Sort::Name, false),
+            (cpu_x, 7, "CPU %", Sort::Cpu, true),
+            (rss_x, 9, "RSS", Sort::Memory, true),
+            (
+                name_x + name_width + 1,
+                if wide { 3 } else { 0 },
+                "S",
+                Sort::State,
+                false,
+            ),
+            (
+                rss_x + 11,
+                if wide { 5 } else { 0 },
+                "THR",
+                Sort::Threads,
+                true,
+            ),
+        ] {
+            if width == 0 {
+                continue;
+            }
+            let active = view.sort.column == column;
+            let style = if active { Style::Accent } else { Style::Title };
+            let len = (label.len() + usize::from(active)).min(width);
+            let header_x = col_x + if right { width - len } else { 0 };
+            self.text(header_x, header_y, len, label, style);
+            if active && label.len() < width {
+                self.put(header_x + label.len(), header_y, view.sort.marker(), style);
+            }
         }
         self.line(r.x + 1, r.y + 2, r.w - 2, '─');
         for i in 0..capacity {
@@ -832,7 +838,17 @@ impl Frame {
                     Style::Text
                 },
             );
-            self.right(rss_x, y, 9, &bytes(p.rss), text_style);
+            self.right(
+                rss_x,
+                y,
+                9,
+                &bytes(p.rss),
+                if selected {
+                    Style::Active
+                } else {
+                    Style::Memory
+                },
+            );
             if wide {
                 self.put(
                     name_x + name_width + 2,
@@ -844,17 +860,32 @@ impl Frame {
                     },
                     if selected {
                         Style::Active
-                    } else if p.state == 'R' {
-                        Style::Good
                     } else {
-                        Style::Muted
+                        match p.state {
+                            'R' => Style::Good,
+                            'T' | 't' => Style::Warning,
+                            'Z' | 'X' => Style::Error,
+                            _ => Style::Muted,
+                        }
                     },
                 );
                 self.right(rss_x + 11, y, 5, &p.threads.to_string(), muted);
             }
         }
-        let hint = format!(" {} sort | 100% = one core ", view.sort.label());
-        self.text(r.x + 2, r.y + r.h - 1, r.width(), &hint, Style::Muted);
+        let hint = if r.width() >= 64 {
+            format!(
+                " {} {} | c/m/p/n/S/T Sort | o Reverse | 100% = one core ",
+                view.sort.column.label(),
+                view.sort.direction()
+            )
+        } else {
+            format!(
+                " {} {} | c/m/p/n/S/T | o Rev ",
+                view.sort.column.label(),
+                view.sort.direction()
+            )
+        };
+        self.text(r.x + 2, r.y + r.h - 1, r.width(), &hint, Style::Accent);
         if count == 0 && capacity > 0 {
             self.text(x, r.y + 3, r.width(), "No readable processes", Style::Muted);
         }
@@ -1117,9 +1148,9 @@ mod tests {
         p.state = 'R';
         p.threads = 128;
         let mut tasks = Tasks::default();
-        tasks.refresh(&system, Sort::Cpu);
+        tasks.refresh(&system, SortOrder::new(Sort::Cpu));
         let view = View {
-            sort: Sort::Cpu,
+            sort: SortOrder::new(Sort::Cpu),
             offset: 0,
             page: 3,
             paused: false,

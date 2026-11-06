@@ -8,7 +8,7 @@
 %global __os_install_post %{nil}
 
 Name:           ktop
-Version:        0.3.0
+Version:        0.4.0
 Release:        1.portable%{?dist}
 Summary:        Tiny Linux terminal system monitor (portable static build)
 License:        MIT
@@ -44,6 +44,9 @@ cmp -s ktop %{buildroot}%{_bindir}/ktop
 %{_bindir}/ktop
 
 %changelog
+* Fri Nov 06 2026 ktop maintainers - 0.4.0-1.portable
+- Package the colorful dashboard and reversible process-table sorting release.
+
 * Thu Nov 05 2026 ktop maintainers - 0.3.0-1.portable
 - Package the explicitly verified static executable without claiming a source build.
 - Keep native vendored source RPM builds and their complete tests separate.

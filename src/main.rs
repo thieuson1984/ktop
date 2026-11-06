@@ -43,6 +43,9 @@ enum Sort {
     Cpu,
     Memory,
     Pid,
+    Name,
+    State,
+    Threads,
 }
 impl Sort {
     fn label(self) -> &'static str {
@@ -50,7 +53,37 @@ impl Sort {
             Self::Cpu => "CPU",
             Self::Memory => "RSS",
             Self::Pid => "PID",
+            Self::Name => "NAME",
+            Self::State => "STATE",
+            Self::Threads => "THR",
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SortOrder {
+    column: Sort,
+    descending: bool,
+}
+impl SortOrder {
+    fn new(column: Sort) -> Self {
+        Self {
+            column,
+            descending: matches!(column, Sort::Cpu | Sort::Memory | Sort::Threads),
+        }
+    }
+    fn select(&mut self, column: Sort) {
+        if self.column == column {
+            self.descending = !self.descending;
+        } else {
+            *self = Self::new(column);
+        }
+    }
+    fn direction(self) -> &'static str {
+        if self.descending { "desc" } else { "asc" }
+    }
+    fn marker(self) -> char {
+        if self.descending { '↓' } else { '↑' }
     }
 }
 struct Options {
@@ -65,7 +98,7 @@ fn options() -> Result<Option<Options>, String> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "ktop {} - compact Linux monitor and process manager\n\nUsage: ktop [--interval SECONDS] [--once]\n\n  --interval SECONDS   Refresh period, 0.2 to 60 (default 1)\n  --once               Print one read-only local snapshot\n  --version            Print version\n\nKeys: q quit | 1 overview | 2 hardware | 3 processes\n      c/m/p CPU/RSS/PID sort | j/k or arrows scroll/select\n      / filter by name or exact PID | g/G first/last process\n      t terminate | K force kill | s suspend | r resume (process view)\n      y confirm action | Esc cancel | Space pause | +/- refresh rate\n      Ctrl-Z suspend ktop safely; shell fg resumes it\n\nActions require confirmation and normal kernel signal permissions.\nPID 0, PID 1, and ktop itself are protected. No privilege escalation.\nCPU: one busy core is 100% per process. NO_COLOR disables styling.\nNo network requests, task database, or persistent logs.",
+                    "ktop {} - compact Linux monitor and process manager\n\nUsage: ktop [--interval SECONDS] [--once]\n\n  --interval SECONDS   Refresh period, 0.2 to 60 (default 1)\n  --once               Print one read-only local snapshot\n  --version            Print version\n\nKeys: q quit | 1 overview | 2 hardware | 3 processes\n      c/m/p/n CPU/RSS/PID/name sort | S/T state/threads sort\n      Repeat a sort key to reverse | o reverse current sort\n      j/k or arrows scroll/select | g/G first/last process\n      / filter by name or exact PID\n      t terminate | K force kill | s suspend | r resume (process view)\n      y confirm action | Esc cancel | Space pause | +/- refresh rate\n      Ctrl-Z suspend ktop safely; shell fg resumes it\n\nActions require confirmation and normal kernel signal permissions.\nPID 0, PID 1, and ktop itself are protected. No privilege escalation.\nCPU: one busy core is 100% per process. NO_COLOR disables styling.\nNo network requests, task database, or persistent logs.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(None);
@@ -142,21 +175,21 @@ fn run() -> Result<(), String> {
     let mut system = System::new();
     system.sample();
     let mut tasks = Tasks::default();
-    tasks.refresh(&system, Sort::Cpu);
+    tasks.refresh(&system, SortOrder::new(Sort::Cpu));
     if opts.once {
         std::thread::sleep(opts.interval);
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
         }
         system.sample();
-        tasks.refresh(&system, Sort::Cpu);
+        tasks.refresh(&system, SortOrder::new(Sort::Cpu));
         let hardware = Hardware::collect();
         let mut frame = Frame::new(100, 40);
         frame.render(
             &system,
             &hardware,
             View {
-                sort: Sort::Cpu,
+                sort: SortOrder::new(Sort::Cpu),
                 offset: 0,
                 page: 1,
                 paused: false,
@@ -183,7 +216,7 @@ fn run() -> Result<(), String> {
     let mut hardware_at = Instant::now();
     let mut interval = opts.interval;
     let mut next = Instant::now() + interval;
-    let mut sort = Sort::Cpu;
+    let mut sort = SortOrder::new(Sort::Cpu);
     let mut offset: usize = 0;
     let mut page = 1;
     let mut paused = false;
@@ -423,12 +456,19 @@ fn run() -> Result<(), String> {
                             offset = 0;
                         }
                     }
-                    Key::Char(b'c' | b'm' | b'p') => {
-                        sort = match key {
-                            Key::Char(b'm') => Sort::Memory,
-                            Key::Char(b'p') => Sort::Pid,
-                            _ => Sort::Cpu,
-                        };
+                    Key::Char(b'c' | b'm' | b'p' | b'n' | b'S' | b'T' | b'o') => {
+                        if let Key::Char(b'o') = key {
+                            sort.descending = !sort.descending;
+                        } else {
+                            sort.select(match key {
+                                Key::Char(b'm') => Sort::Memory,
+                                Key::Char(b'p') => Sort::Pid,
+                                Key::Char(b'n') => Sort::Name,
+                                Key::Char(b'S') => Sort::State,
+                                Key::Char(b'T') => Sort::Threads,
+                                _ => Sort::Cpu,
+                            });
+                        }
                         tasks.refresh(&system, sort);
                         offset = 0;
                     }

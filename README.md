@@ -38,9 +38,13 @@ panels. Overflowing labels use ellipses, while numeric columns retain their own
 space. The hardware inventory exposes every collected sensor/GPU field and CPU
 core. Compact `K/M/G/T` labels mean KiB/MiB/GiB/TiB.
 
-Colors use the terminal's palette and default background. `NO_COLOR=1` disables
-styling; tabs, status labels, borders, selection marker, and confirmation text
-remain meaningful without color. Only changed terminal spans are transmitted.
+Colors use the terminal's palette and default background: cyan for CPU, magenta
+for memory, blue for storage, and distinct inbound/outbound traffic readouts.
+Amber marks high utilization or stopped processes; red marks errors or zombie
+processes. Active tabs and the selected process use a cyan highlight.
+`NO_COLOR=1` disables styling; tabs, status labels, sort arrows, selection marker,
+and confirmation text remain meaningful without color. Only changed terminal
+spans are transmitted.
 
 ```sh
 ktop
@@ -55,7 +59,9 @@ read-only, ANSI-free UTF-8 snapshot; it never signals processes or creates a fil
 | Key | Action |
 | --- | --- |
 | `1` / `2` / `3` | Overview / hardware / processes |
-| `c` / `m` / `p` | CPU / resident-memory / PID sort |
+| `c` / `m` / `p` / `n` | Sort by CPU / resident memory / PID / name; repeat to reverse |
+| `S` / `T` | Sort by state / thread count; repeat to reverse (uppercase) |
+| `o` | Reverse the current sort |
 | `j` / `k`, Down / Up | Scroll; select a process in view 3 |
 | Page Up / Page Down | Move by a page in view 3 |
 | `g` / `G`, Home / End | First / last item |
@@ -68,6 +74,14 @@ read-only, ANSI-free UTF-8 snapshot; it never signals processes or creates a fil
 | `+` / `-` | Faster/slower refresh |
 | `q`, Ctrl-C, Ctrl-D | Quit (`q` is text while editing a filter) |
 | Ctrl-Z | Restore the terminal and suspend ktop; shell `fg` resumes it |
+
+The active column shows `↑` (ascending) or `↓` (descending), with the column and
+direction repeated below the table, including when a column is hidden in a narrow
+terminal. Switching columns starts CPU, RSS, and thread count highest-first;
+PID, name, and state start ascending. Names sort case-insensitively for ASCII;
+states sort by their kernel letter. Equal values use ascending PID as a stable
+tie-breaker (CPU uses RSS first). Sorting preserves the selected process identity
+and works while collection is paused or a filter is active.
 
 An applied process filter persists in the process and overview lists; both show
 the active query and match count. Apply an empty filter to return to all tasks.
@@ -195,7 +209,7 @@ scripts/build-release.sh armv7
 ```
 
 Outputs: `target/release/ARCH/ktop`, its sibling `licenses/`, and
-`dist/ktop-0.3.0-linux-ARCH.tar.gz`. Distribute the entire portable archive, or
+`dist/ktop-0.4.0-linux-ARCH.tar.gz`. Distribute the entire portable archive, or
 both the executable and its licenses directory. No musl installation is needed
 on the destination. The archive contains only the executable, README, and notices.
 
@@ -227,15 +241,15 @@ tools). Package a canonical static build without root:
 
 ```sh
 scripts/build-deb.sh x86_64
-sudo apt install ./dist/ktop_0.3.0_amd64.deb
+sudo apt install ./dist/ktop_0.4.0_amd64.deb
 
 # On an ARM host, use its architecture; for cross packaging retain the runner:
 KTOP_RUNNER=qemu-aarch64-static scripts/build-deb.sh aarch64
 KTOP_RUNNER=qemu-arm-static scripts/build-deb.sh armv7
 ```
 
-Outputs: `ktop_0.3.0_amd64.deb`, `ktop_0.3.0_arm64.deb`, or
-`ktop_0.3.0_armhf.deb` in `dist/`. Packages preserve the static executable,
+Outputs: `ktop_0.4.0_amd64.deb`, `ktop_0.4.0_arm64.deb`, or
+`ktop_0.4.0_armhf.deb` in `dist/`. Packages preserve the static executable,
 install mode 0755 with root ownership, include application/dependency/runtime
 notices under `/usr/share/doc/ktop/`, and have no shared-library dependency,
 maintainer scripts, daemon, privileged helper, or setuid permission.
@@ -255,17 +269,17 @@ version, vendors the locked dependency offline, and builds frozen native source:
 ```sh
 # Native x86-64 Fedora:
 scripts/build-rpm.sh x86_64
-sudo dnf install ./dist/ktop-0.3.0-1.fc45.x86_64.rpm
+sudo dnf install ./dist/ktop-0.4.0-1.fc45.x86_64.rpm
 
 # Native ARM64 Fedora:
 scripts/build-rpm.sh aarch64
 
 # Rebuild complete source on a matching native Fedora host:
-rpmbuild --rebuild --target x86_64 ./dist/ktop-0.3.0-1.fc45.src.rpm
+rpmbuild --rebuild --target x86_64 ./dist/ktop-0.4.0-1.fc45.src.rpm
 ```
 
-Native outputs are `ktop-0.3.0-1.fc45.ARCH.rpm`,
-`ktop-0.3.0-1.fc45.src.rpm`, and `ktop-0.3.0.tar.gz`. The source archive contains
+Native outputs are `ktop-0.4.0-1.fc45.ARCH.rpm`,
+`ktop-0.4.0-1.fc45.src.rpm`, and `ktop-0.4.0.tar.gz`. The source archive contains
 vendored libc, Cargo configuration, tests, build scripts, and notices, **not a
 prebuilt executable**. Native RPMs link to Fedora's glibc/libgcc; complete
 unit/PTY suites and binary preflight run inside the source build. A fresh Cargo
@@ -277,7 +291,7 @@ For cross-packaged static ARM64, use the separate explicit binary-only mode:
 
 ```sh
 KTOP_RUNNER=qemu-aarch64-static scripts/build-rpm.sh --portable-binary aarch64
-sudo dnf install ./dist/ktop-0.3.0-1.portable.fc45.aarch64.rpm
+sudo dnf install ./dist/ktop-0.4.0-1.portable.fc45.aarch64.rpm
 ```
 
 That mode creates **only** a `1.portable.fc45` binary RPM from the verified
@@ -315,6 +329,18 @@ release artifacts are checked for private paths and identifiers before publicati
 
 - [Audit findings, verification, security model, and measured tradeoffs](AUDIT.md)
 - [Prioritized roadmap and future release gates](ROADMAP.md)
+
+### 0.4.0
+
+- Sort processes by CPU, resident memory, PID, name, state, or thread count.
+  Repeat a column shortcut or press `o` to reverse; arrows and direction labels
+  show the current order, including in monochrome and narrow terminals.
+- Keep the selected process identity and stable PID tie-breakers when sorting,
+  including while paused or filtering.
+- Distinguish CPU, memory, storage, traffic, and process states with a coordinated
+  terminal palette, clearer headings, and highlighted tabs and selection.
+- Preserve process-action safeguards, the default terminal background, and
+  `NO_COLOR` support. No new dependencies or data migration.
 
 ### 0.3.0
 
